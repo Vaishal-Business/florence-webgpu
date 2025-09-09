@@ -14,8 +14,15 @@
 <body>
 
 <h1>SmolVLM WebGPU Demo</h1>
-<input type="file" id="imageUpload" accept="image/*">
-<input type="text" id="prompt" placeholder="Enter your prompt" value="extract the text from image accurately">
+
+<label>Upload ONNX model:</label>
+<input type="file" id="onnxUpload" accept=".onnx"><br>
+
+<label>Upload image:</label>
+<input type="file" id="imageUpload" accept="image/*"><br>
+
+<input type="text" id="prompt" placeholder="Enter your prompt" value="extract the text from image accurately"><br>
+
 <button id="runBtn">Run Model</button>
 
 <img id="preview" src="" alt="Uploaded image preview">
@@ -23,19 +30,29 @@
 
 <script>
 let session = null;
+let modelLoaded = false;
 
-// Preload ONNX model (WebGPU)
-async function loadModel() {
+// Handle ONNX model upload
+document.getElementById('onnxUpload').addEventListener('change', async (evt) => {
+    const file = evt.target.files[0];
+    if (!file) return;
+
     document.getElementById('output').textContent = 'Loading model...';
-    session = await ort.InferenceSession.create('https://github.com/Vaishal-Business/florence-webgpu/raw/refs/heads/main/decoder_model_merged_q4f16.onnx', {
-        executionProviders: ['webgpu']
-    });
-    document.getElementById('output').textContent = 'Model loaded!';
-}
+    const arrayBuffer = await file.arrayBuffer();
+    session = await ort.InferenceSession.create(arrayBuffer, { executionProviders: ['webgpu'] });
+    modelLoaded = true;
+    document.getElementById('output').textContent = 'Model loaded! Ready to run inference.';
+});
 
-loadModel();
+// Handle image upload preview
+document.getElementById('imageUpload').addEventListener('change', (evt) => {
+    const file = evt.target.files[0];
+    if (!file) return;
+    const img = document.getElementById('preview');
+    img.src = URL.createObjectURL(file);
+});
 
-// Resize image to 160x160 for fast inference
+// Resize image to 160x160
 function resizeImage(img) {
     const canvas = document.createElement('canvas');
     const size = 160;
@@ -53,26 +70,19 @@ function imageDataToTensor(imageData) {
     for (let y = 0; y < height; y++) {
         for (let x = 0; x < width; x++) {
             const idx = (y * width + x) * 4;
-            floatData[y * width + x] = data[idx] / 255;             // R
-            floatData[width * height + y * width + x] = data[idx+1] / 255; // G
-            floatData[2*width*height + y*width + x] = data[idx+2]/255; // B
+            const i = y * width + x;
+            floatData[i] = data[idx] / 255;                 // R
+            floatData[width*height + i] = data[idx+1] / 255; // G
+            floatData[2*width*height + i] = data[idx+2] / 255; // B
         }
     }
     return floatData;
 }
 
-// Handle file upload preview
-document.getElementById('imageUpload').addEventListener('change', (evt) => {
-    const file = evt.target.files[0];
-    if (!file) return;
-    const img = document.getElementById('preview');
-    img.src = URL.createObjectURL(file);
-});
-
-// Run model on uploaded image
+// Run model
 document.getElementById('runBtn').addEventListener('click', async () => {
-    if (!session) {
-        alert('Model not loaded yet!');
+    if (!modelLoaded) {
+        alert('Upload an ONNX model first!');
         return;
     }
     const imgEl = document.getElementById('preview');
@@ -83,7 +93,6 @@ document.getElementById('runBtn').addEventListener('click', async () => {
 
     const prompt = document.getElementById('prompt').value || "extract the text from image accurately";
 
-    // Wait for image to load
     const img = new Image();
     img.src = imgEl.src;
     await new Promise(r => img.onload = r);
@@ -91,7 +100,7 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     const imageData = resizeImage(img);
     const pixelValues = imageDataToTensor(imageData);
 
-    // Dummy input_ids: 1 token sequence (for demo purposes)
+    // Dummy input_ids for demo
     const inputIds = new BigInt64Array([0]);
 
     const feeds = {
@@ -105,7 +114,7 @@ document.getElementById('runBtn').addEventListener('click', async () => {
 
     document.getElementById('output').textContent =
         `Inference done in ${(t1 - t0).toFixed(2)} ms\n` +
-        `Model output (logits array length): ${results.logits.data.length}`;
+        `Model output keys: ${Object.keys(results).join(', ')}`;
 });
 </script>
 
