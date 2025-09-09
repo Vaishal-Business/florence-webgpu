@@ -143,8 +143,7 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     const decoderFeeds = {
         pixel_values: visionEmbeds,
         inputs_embeds: inputsEmbeds,
-        attention_mask: new ort.Tensor('int64', attentionMask, [1,maxLen]),
-        pixel_attention_mask: new ort.Tensor('int64', pixelAttentionMask, [1,numPatches])
+        attention_mask: new ort.Tensor('int64', attentionMask, [1,maxLen])
     };
 
     const t0 = performance.now();
