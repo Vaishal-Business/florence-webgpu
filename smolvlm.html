@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>SmolVLM WebGPU Safe Demo</title>
+<title>SmolVLM WebGPU Full Demo</title>
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 <style>
   body { font-family: Arial; padding: 20px; background: #111; color: #eee; }
@@ -13,7 +13,7 @@
 </head>
 <body>
 
-<h1>SmolVLM WebGPU Demo</h1>
+<h1>SmolVLM WebGPU Full Demo</h1>
 
 <input type="file" id="imageUpload" accept="image/*"><br>
 <input type="text" id="prompt" placeholder="Enter your prompt" value="extract the text from image accurately"><br>
@@ -23,28 +23,25 @@
 <pre id="output">Loading models...</pre>
 
 <script>
+let visionSession = null;
 let embedSession = null;
 let decoderSession = null;
 
 // ONNX URLs
+const visionURL = 'https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/onnx/vision_encoder_q4f16.onnx';
 const embedURL = 'https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/onnx/embed_tokens.onnx';
 const decoderURL = 'https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/onnx/decoder_model_merged_q4f16.onnx';
 
-// Load models safely
+// Load all models
 async function loadModels() {
-    document.getElementById('output').textContent = 'Loading embedding model...';
-    embedSession = await ort.InferenceSession.create(embedURL, {
-        executionProviders: ['webgpu', 'wasm'],
-        gpuOptions: { useBufferMapping: false }
-    });
-
-    document.getElementById('output').textContent = 'Loading decoder model...';
-    decoderSession = await ort.InferenceSession.create(decoderURL, {
-        executionProviders: ['webgpu', 'wasm'],
-        gpuOptions: { useBufferMapping: false }
-    });
-
-    document.getElementById('output').textContent = 'Models loaded! Upload an image and enter a prompt.';
+    const outputEl = document.getElementById('output');
+    outputEl.textContent = 'Loading vision encoder...';
+    visionSession = await ort.InferenceSession.create(visionURL, {executionProviders: ['webgpu','wasm'], gpuOptions:{useBufferMapping:false}});
+    outputEl.textContent = 'Loading text embedding model...';
+    embedSession = await ort.InferenceSession.create(embedURL, {executionProviders: ['webgpu','wasm'], gpuOptions:{useBufferMapping:false}});
+    outputEl.textContent = 'Loading decoder...';
+    decoderSession = await ort.InferenceSession.create(decoderURL, {executionProviders: ['webgpu','wasm'], gpuOptions:{useBufferMapping:false}});
+    outputEl.textContent = 'Models loaded! Upload an image and enter a prompt.';
 }
 
 loadModels();
@@ -72,22 +69,22 @@ function resizeImage(img) {
 function imageDataToTensor(imageData) {
     const { data, width, height } = imageData;
     const floatData = new Float32Array(3 * width * height);
-    for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-            const idx = (y * width + x) * 4;
-            const i = y * width + x;
-            floatData[i] = data[idx] / 255;                 // R
-            floatData[width*height + i] = data[idx+1] / 255; // G
-            floatData[2*width*height + i] = data[idx+2] / 255; // B
+    for (let y=0; y<height; y++){
+        for (let x=0; x<width; x++){
+            const idx = (y*width + x)*4;
+            const i = y*width + x;
+            floatData[i] = data[idx]/255;                 // R
+            floatData[width*height + i] = data[idx+1]/255; // G
+            floatData[2*width*height + i] = data[idx+2]/255; // B
         }
     }
     return floatData;
 }
 
 // Simple tokenizer (dummy)
-function simpleTokenizer(text, maxLen=8) { // reduced length for mobile safety
-    const tokens = text.split(' ').slice(0, maxLen).map((_,i) => BigInt(i+1));
-    while (tokens.length < maxLen) tokens.push(0n); // pad
+function simpleTokenizer(text, maxLen=8){
+    const tokens = text.split(' ').slice(0,maxLen).map((_,i)=>BigInt(i+1));
+    while(tokens.length<maxLen) tokens.push(0n);
     return new BigInt64Array(tokens);
 }
 
@@ -95,41 +92,53 @@ function simpleTokenizer(text, maxLen=8) { // reduced length for mobile safety
 document.getElementById('runBtn').addEventListener('click', async () => {
     const outputEl = document.getElementById('output');
 
-    if (!embedSession || !decoderSession) {
+    if(!visionSession || !embedSession || !decoderSession){
         alert('Models not loaded yet!');
         return;
     }
 
     const imgEl = document.getElementById('preview');
-    if (!imgEl.src) {
+    if(!imgEl.src){
         alert('Upload an image first!');
         return;
     }
 
     const prompt = document.getElementById('prompt').value || "extract the text from image accurately";
 
+    // Wait image load
     const img = new Image();
     img.src = imgEl.src;
-    await new Promise(r => img.onload = r);
+    await new Promise(r=>img.onload=r);
 
+    // Prepare image
     const imageData = resizeImage(img);
     const pixelValues = imageDataToTensor(imageData);
 
-    // Tokenize prompt
-    const inputIds = simpleTokenizer(prompt, 8);
+    // Vision encoder
+    const visionFeeds = { pixel_values: new ort.Tensor('float32', pixelValues, [1,3,160,160]) };
+    const visionResult = await visionSession.run(visionFeeds);
+    const visionKey = Object.keys(visionResult)[0];
+    const visionEmbeds = visionResult[visionKey]; // ort.Tensor
 
-    // Run embedding model
-    const embedFeeds = { input_ids: new ort.Tensor('int64', inputIds, [1, inputIds.length]) , attention_mask: new ort.Tensor('int64', attentionMask, [1, maxLen]) };
+    // Text embedding
+    const maxLen = 8;
+    const inputIds = simpleTokenizer(prompt, maxLen);
+    const attentionMask = new BigInt64Array(maxLen);
+    for(let i=0;i<maxLen;i++) attentionMask[i] = inputIds[i]===0n ? 0n : 1n;
+
+    const embedFeeds = {
+        input_ids: new ort.Tensor('int64', inputIds, [1,maxLen]),
+        attention_mask: new ort.Tensor('int64', attentionMask, [1,maxLen])
+    };
     const embedResult = await embedSession.run(embedFeeds);
-    
-    // Grab the first key as inputs_embeds
     const embedKey = Object.keys(embedResult)[0];
     const inputsEmbeds = embedResult[embedKey];
 
-    // Run decoder model
+    // Decoder
     const decoderFeeds = {
-        pixel_values: new ort.Tensor('float32', pixelValues, [1,3,160,160]),
-        inputs_embeds: inputsEmbeds
+        pixel_values: visionEmbeds,    // output from vision encoder
+        inputs_embeds: inputsEmbeds,
+        attention_mask: new ort.Tensor('int64', attentionMask, [1,maxLen])
     };
 
     const t0 = performance.now();
@@ -137,10 +146,9 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     const t1 = performance.now();
 
     outputEl.textContent =
-        `Inference done in ${(t1 - t0).toFixed(2)} ms\n` +
+        `Inference done in ${(t1-t0).toFixed(2)} ms\n`+
         `Decoder output keys: ${Object.keys(decoderResult).join(', ')}`;
 });
 </script>
-
 </body>
 </html>
