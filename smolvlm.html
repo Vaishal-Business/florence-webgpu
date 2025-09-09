@@ -120,6 +120,11 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     const visionKey = Object.keys(visionResult)[0];
     const visionEmbeds = visionResult[visionKey]; // ort.Tensor
 
+    // Pixel attention mask (all ones)
+    const numPatches = visionEmbeds.dims[1];
+    const pixelAttentionMask = new BigInt64Array(numPatches);
+    for(let i=0;i<numPatches;i++) pixelAttentionMask[i] = 1n;
+
     // Text embedding
     const maxLen = 8;
     const inputIds = simpleTokenizer(prompt, maxLen);
@@ -136,9 +141,10 @@ document.getElementById('runBtn').addEventListener('click', async () => {
 
     // Decoder
     const decoderFeeds = {
-        pixel_values: visionEmbeds,    // output from vision encoder
+        pixel_values: visionEmbeds,
         inputs_embeds: inputsEmbeds,
-        attention_mask: new ort.Tensor('int64', attentionMask, [1,maxLen])
+        attention_mask: new ort.Tensor('int64', attentionMask, [1,maxLen]),
+        pixel_attention_mask: new ort.Tensor('int64', pixelAttentionMask, [1,numPatches])
     };
 
     const t0 = performance.now();
