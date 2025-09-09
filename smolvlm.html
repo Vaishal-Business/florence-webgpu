@@ -13,7 +13,7 @@
 </head>
 <body>
 
-<h1>SmolVLM WebGPU Safe Demo</h1>
+<h1>SmolVLM WebGPU Demo</h1>
 
 <input type="file" id="imageUpload" accept="image/*"><br>
 <input type="text" id="prompt" placeholder="Enter your prompt" value="extract the text from image accurately"><br>
@@ -30,7 +30,7 @@ let decoderSession = null;
 const embedURL = 'https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/onnx/embed_tokens.onnx';
 const decoderURL = 'https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/onnx/decoder_model_merged_q4f16.onnx';
 
-// WebGPU-safe model loading
+// Load models safely
 async function loadModels() {
     document.getElementById('output').textContent = 'Loading embedding model...';
     embedSession = await ort.InferenceSession.create(embedURL, {
@@ -84,7 +84,7 @@ function imageDataToTensor(imageData) {
     return floatData;
 }
 
-// Simple dummy tokenizer
+// Simple tokenizer (dummy)
 function simpleTokenizer(text, maxLen=8) { // reduced length for mobile safety
     const tokens = text.split(' ').slice(0, maxLen).map((_,i) => BigInt(i+1));
     while (tokens.length < maxLen) tokens.push(0n); // pad
@@ -118,12 +118,15 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     // Tokenize prompt
     const inputIds = simpleTokenizer(prompt, 8);
 
-    // Get embeddings
-    const embedFeeds = { input_ids: new ort.Tensor('int64', inputIds, [1,8]) };
+    // Run embedding model
+    const embedFeeds = { input_ids: new ort.Tensor('int64', inputIds, [1, inputIds.length]) };
     const embedResult = await embedSession.run(embedFeeds);
-    const inputsEmbeds = embedResult.output || embedResult['output']; // depends on ONNX key
+    
+    // Grab the first key as inputs_embeds
+    const embedKey = Object.keys(embedResult)[0];
+    const inputsEmbeds = embedResult[embedKey];
 
-    // Decoder feeds
+    // Run decoder model
     const decoderFeeds = {
         pixel_values: new ort.Tensor('float32', pixelValues, [1,3,160,160]),
         inputs_embeds: inputsEmbeds
