@@ -119,7 +119,7 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     const inputIds = simpleTokenizer(prompt, 8);
 
     // Run embedding model
-    const embedFeeds = { input_ids: new ort.Tensor('int64', inputIds, [1, inputIds.length]) };
+    const embedFeeds = { input_ids: new ort.Tensor('int64', inputIds, [1, inputIds.length])attention_mask: new ort.Tensor('int64', attentionMask, [1, maxLen]) };
     const embedResult = await embedSession.run(embedFeeds);
     
     // Grab the first key as inputs_embeds
