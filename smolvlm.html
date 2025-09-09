@@ -27,7 +27,7 @@ let session = null;
 // Preload ONNX model (WebGPU)
 async function loadModel() {
     document.getElementById('output').textContent = 'Loading model...';
-    session = await ort.InferenceSession.create('decoder_model_merged_q4f16.onnx', {
+    session = await ort.InferenceSession.create('https://github.com/Vaishal-Business/florence-webgpu/raw/refs/heads/main/decoder_model_merged_q4f16.onnx', {
         executionProviders: ['webgpu']
     });
     document.getElementById('output').textContent = 'Model loaded!';
