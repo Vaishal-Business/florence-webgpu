@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SmolVLM WebGPU Demo</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<style>
+  body { font-family: Arial; padding: 20px; background: #111; color: #eee; }
+  input, button { margin: 10px 0; }
+  img { max-width: 300px; display: block; margin: 10px 0; }
+  pre { background: #222; padding: 10px; }
+</style>
+</head>
+<body>
+
+<h1>SmolVLM WebGPU Demo</h1>
+<input type="file" id="imageUpload" accept="image/*">
+<input type="text" id="prompt" placeholder="Enter your prompt" value="extract the text from image accurately">
+<button id="runBtn">Run Model</button>
+
+<img id="preview" src="" alt="Uploaded image preview">
+<pre id="output"></pre>
+
+<script>
+let session = null;
+
+// Preload ONNX model (WebGPU)
+async function loadModel() {
+    document.getElementById('output').textContent = 'Loading model...';
+    session = await ort.InferenceSession.create('decoder_model_merged_q4f16.onnx', {
+        executionProviders: ['webgpu']
+    });
+    document.getElementById('output').textContent = 'Model loaded!';
+}
+
+loadModel();
+
+// Resize image to 160x160 for fast inference
+function resizeImage(img) {
+    const canvas = document.createElement('canvas');
+    const size = 160;
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, size, size);
+    return ctx.getImageData(0, 0, size, size);
+}
+
+// Convert ImageData to Float32Array (C,H,W)
+function imageDataToTensor(imageData) {
+    const { data, width, height } = imageData;
+    const floatData = new Float32Array(3 * width * height);
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const idx = (y * width + x) * 4;
+            floatData[y * width + x] = data[idx] / 255;             // R
+            floatData[width * height + y * width + x] = data[idx+1] / 255; // G
+            floatData[2*width*height + y*width + x] = data[idx+2]/255; // B
+        }
+    }
+    return floatData;
+}
+
+// Handle file upload preview
+document.getElementById('imageUpload').addEventListener('change', (evt) => {
+    const file = evt.target.files[0];
+    if (!file) return;
+    const img = document.getElementById('preview');
+    img.src = URL.createObjectURL(file);
+});
+
+// Run model on uploaded image
+document.getElementById('runBtn').addEventListener('click', async () => {
+    if (!session) {
+        alert('Model not loaded yet!');
+        return;
+    }
+    const imgEl = document.getElementById('preview');
+    if (!imgEl.src) {
+        alert('Upload an image first!');
+        return;
+    }
+
+    const prompt = document.getElementById('prompt').value || "extract the text from image accurately";
+
+    // Wait for image to load
+    const img = new Image();
+    img.src = imgEl.src;
+    await new Promise(r => img.onload = r);
+
+    const imageData = resizeImage(img);
+    const pixelValues = imageDataToTensor(imageData);
+
+    // Dummy input_ids: 1 token sequence (for demo purposes)
+    const inputIds = new BigInt64Array([0]);
+
+    const feeds = {
+        pixel_values: new ort.Tensor('float32', pixelValues, [1,3,160,160]),
+        input_ids: new ort.Tensor('int64', inputIds, [1,1])
+    };
+
+    const t0 = performance.now();
+    const results = await session.run(feeds);
+    const t1 = performance.now();
+
+    document.getElementById('output').textContent =
+        `Inference done in ${(t1 - t0).toFixed(2)} ms\n` +
+        `Model output (logits array length): ${results.logits.data.length}`;
+});
+</script>
+
+</body>
+</html>
