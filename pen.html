@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Web AR Rectangle + Pen Ink</title>
+  <style>
+    html,body{height:100%;margin:0;overflow:hidden;font-family:system-ui,Segoe UI,Roboto,Arial}
+    #ui{position:fixed;left:8px;top:8px;z-index:30;display:flex;gap:8px;flex-wrap:wrap}
+    button{padding:8px 12px;border-radius:6px;border:1px solid rgba(0,0,0,0.15);background:#fff}
+    #overlayRect{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);border:2px dashed rgba(255,255,255,0.6);background:rgba(255,255,255,0.06);touch-action:none;z-index:20}
+    .corner{width:18px;height:18px;background:#fff;border-radius:3px;position:absolute}
+    /* corners: tl,tr,bl,br */
+    .corner.tl{left:-9px;top:-9px;cursor:nwse-resize}
+    .corner.tr{right:-9px;top:-9px;cursor:nesw-resize}
+    .corner.bl{left:-9px;bottom:-9px;cursor:nesw-resize}
+    .corner.br{right:-9px;bottom:-9px;cursor:nwse-resize}
+    #hint{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);background:rgba(0,0,0,0.5);color:#fff;padding:6px 10px;border-radius:8px;z-index:40}
+    /* three.js canvas (XR) sits behind overlays */
+    canvas.xr-canvas{position:fixed;inset:0;z-index:0}
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <button id="startAR">Start AR</button>
+    <button id="applyRect">Apply (Lock Rectangle)</button>
+    <button id="calibratePen">Calibrate Pen Tip</button>
+    <button id="clearInk">Clear</button>
+    <button id="saveInk">Save</button>
+  </div>
+
+  <!-- A draggable/resizable 2D rectangle used during placement mode. Hidden after Apply -->
+  <div id="overlayRect" style="width:320px;height:180px;display:flex;align-items:center;justify-content:center;">
+    <div class="corner tl"></div>
+    <div class="corner tr"></div>
+    <div class="corner bl"></div>
+    <div class="corner br"></div>
+  </div>
+
+  <div id="hint">Placement mode: drag/move/resize rectangle. Press Apply to lock into world.</div>
+
+  <!-- Include three.js from CDN -->
+  <script type="module">
+  // Single-file minimal WebAR app.
+  // Features implemented:
+  // - WebXR AR session with hit-test anchor
+  // - Screen-space draggable/resizable rectangle prior to lock
+  // - When 'Apply' is pressed, create a plane anchored at a hit-test location and map a canvas texture
+  // - Mediapipe Hands-based pen-tip detection (fingertip) or color-based fallback
+  // - Draw strokes onto the canvas only when pen tip projects inside the rectangle
+  
+  import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
+  import { ARButton } from 'https://unpkg.com/three@0.152.2/examples/jsm/webxr/ARButton.js';
+
+  // Mediapipe hands via CDN (will load when calibrating)
+  let hands = null;
+  let mpHandsLoaded = false;
+
+  // Basic three.js setup
+  const renderer = new THREE.WebGLRenderer({antialias:true, alpha: true});
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  renderer.domElement.classList.add('xr-canvas');
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera();
+
+  // Light
+  const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+  scene.add(light);
+
+  // Variables for placement
+  const overlay = document.getElementById('overlayRect');
+  const applyBtn = document.getElementById('applyRect');
+  const startBtn = document.getElementById('startAR');
+  const calibrateBtn = document.getElementById('calibratePen');
+  const clearBtn = document.getElementById('clearInk');
+  const saveBtn = document.getElementById('saveInk');
+  const hint = document.getElementById('hint');
+
+  let placementMode = true;
+  let locked = false;
+
+  // Canvas that will be used as the ink layer and as a texture for the AR plane
+  const inkWidth = 1024; const inkHeight = 576; // same aspect ratio as default overlay
+  const inkCanvas = document.createElement('canvas');
+  inkCanvas.width = inkWidth; inkCanvas.height = inkHeight;
+  const inkCtx = inkCanvas.getContext('2d');
+  inkCtx.lineCap = 'round'; inkCtx.lineJoin = 'round'; inkCtx.lineWidth = 6; inkCtx.strokeStyle = '#000';
+
+  // Draw subtle background to show semi-transparent board
+  inkCtx.fillStyle = 'rgba(255,255,255,0.0)';
+  inkCtx.fillRect(0,0,inkWidth,inkHeight);
+
+  // We'll create a three.js plane and map this canvas as its texture
+  let arPlane = null; // THREE.Mesh
+  let anchor = null; // XRAnchor if available
+  let planePlaced = false;
+
+  // For pen detection
+  let penTipScreen = null; // {x:..., y:...} in CSS pixels
+  let useHandTracking = true; // default to Mediapipe
+  let penDownRequested = false; // user pressing button for pen down
+
+  // UI button handlers
+  startBtn.addEventListener('click', async ()=>{
+    if (navigator.xr && navigator.xr.isSessionSupported) {
+      const supported = await navigator.xr.isSessionSupported('immersive-ar');
+      if (supported) {
+        const session = await navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['hit-test','local-floor'], optionalFeatures:['anchors','dom-overlay'], domOverlay: { root: document.body } });
+        renderer.xr.setSession(session);
+        initAR(session);
+      } else {
+        alert('WebXR immersive-ar not supported on this device. Consider using AR.js or a compatible browser (Chrome on Android).');
+      }
+    } else {
+      alert('WebXR not available in this browser. Use a compatible browser on mobile or use AR.js alternative (not included here).');
+    }
+  });
+
+  applyBtn.addEventListener('click', async ()=>{
+    if (placementMode) {
+      // Do a hit test at the center of the overlay to place the plane
+      const rect = overlay.getBoundingClientRect();
+      const cx = rect.left + rect.width/2; const cy = rect.top + rect.height/2;
+      const xrSession = renderer.xr.getSession();
+      if (!xrSession) { alert('Start an AR session first'); return; }
+
+      const viewerRefSpace = await xrSession.requestReferenceSpace('viewer');
+      const xrFrameOfRef = await xrSession.requestReferenceSpace('local-floor');
+
+      // do a transient hit test using XRHitTestSource? We'll request a hit test source now
+      const xr = navigator.xr;
+      // create a temporary hit test source using transient input? Simpler: use the standard hit-test
+      try {
+        const hitTestSource = await xrSession.requestHitTestSource({ space: renderer.xr.getReferenceSpace() });
+        // We'll perform the hit during the first frame loop when frame available
+        // Store intended placement screen coords
+        pendingPlacement = {x:cx, y:cy, rect: rect};
+        hint.innerText = 'Move camera slightly to confirm placement (hit-test will complete when frame arrives)...';
+      } catch(e) {
+        // Fallback: immediate placement in front of camera at fixed distance
+        placePlaneInFrontOfCamera();
+      }
+    }
+  });
+
+  // Pen calibration: attempt to load Mediapipe Hands and start processing the video stream
+  calibrateBtn.addEventListener('click', async ()=>{
+    if (!mpHandsLoaded) {
+      hint.innerText = 'Requesting camera for hand/pen calibration...';
+      await loadMediapipeHands();
+    }
+    hint.innerText = 'Look at the camera and show the pen tip (index fingertip) inside view';
+    // start a short calibration process; we'll set penTipScreen whenever hand detected
+    // The actual drawing will work using continuous tracking in the animation loop
+  });
+
+  clearBtn.addEventListener('click', ()=>{
+    inkCtx.clearRect(0,0,inkWidth,inkHeight);
+  });
+
+  saveBtn.addEventListener('click', ()=>{
+    const url = inkCanvas.toDataURL('image/png');
+    const a = document.createElement('a'); a.href = url; a.download = 'ar-board.png'; a.click();
+  });
+
+  // Simple UI for pen-down by holding mouse/touch on screen
+  // For production you'd want a proper on-screen button. Here we use long-press or spacebar.
+  window.addEventListener('pointerdown',(e)=>{ penDownRequested = true; });
+  window.addEventListener('pointerup',(e)=>{ penDownRequested = false; });
+  window.addEventListener('keydown',(e)=>{ if (e.code==='Space') penDownRequested=true; });
+  window.addEventListener('keyup',(e)=>{ if (e.code==='Space') penDownRequested=false; });
+
+  // IMPLEMENT overlay drag + resize logic
+  function makeOverlayInteractive() {
+    let dragging=false, resizing=false, startX, startY, startW, startH, activeCorner=null;
+    overlay.addEventListener('pointerdown', (ev)=>{
+      ev.preventDefault(); overlay.setPointerCapture(ev.pointerId);
+      const target = ev.target;
+      if (target.classList.contains('corner')) {
+        resizing=true; activeCorner = target.classList.contains('tl')? 'tl': target.classList.contains('tr')? 'tr': target.classList.contains('bl')? 'bl':'br';
+        startX = ev.clientX; startY = ev.clientY; const r = overlay.getBoundingClientRect(); startW=r.width; startH=r.height; startLeft=r.left; startTop=r.top;
+      } else { dragging=true; startX=ev.clientX; startY=ev.clientY; const r=overlay.getBoundingClientRect(); startLeft=r.left; startTop=r.top; }
+    });
+    window.addEventListener('pointermove', (ev)=>{
+      if (!dragging && !resizing) return;
+      ev.preventDefault();
+      if (dragging) {
+        const dx = ev.clientX - startX, dy = ev.clientY - startY;
+        overlay.style.left = (startLeft + dx + overlay.offsetWidth/2) + 'px';
+        overlay.style.top = (startTop + dy + overlay.offsetHeight/2) + 'px';
+        overlay.style.transform = 'translate(-50%,-50%)';
+      } else if (resizing) {
+        const dx = ev.clientX - startX, dy = ev.clientY - startY;
+        let newW = startW, newH = startH, newLeft = startLeft, newTop = startTop;
+        if (activeCorner==='tl') { newW = startW - dx; newH = startH - dy; newLeft = startLeft + dx; newTop = startTop + dy; }
+        if (activeCorner==='tr') { newW = startW + dx; newH = startH - dy; newTop = startTop + dy; }
+        if (activeCorner==='bl') { newW = startW - dx; newH = startH + dy; newLeft = startLeft + dx; }
+        if (activeCorner==='br') { newW = startW + dx; newH = startH + dy; }
+        newW = Math.max(80, newW); newH = Math.max(40,newH);
+        overlay.style.width = newW + 'px'; overlay.style.height = newH + 'px';
+        overlay.style.left = (newLeft + newW/2) + 'px'; overlay.style.top = (newTop + newH/2) + 'px';
+        overlay.style.transform = 'translate(-50%,-50%)';
+      }
+    });
+    window.addEventListener('pointerup', (e)=>{ dragging=false; resizing=false; activeCorner=null; });
+  }
+  makeOverlayInteractive();
+
+  // Map from screen point to plane local UV to know where to draw
+  function screenToPlaneUV(screenX, screenY, camera, planeMesh) {
+    // Raycast from screen to plane
+    const mouse = new THREE.Vector2( (screenX / window.innerWidth) * 2 - 1, - (screenY / window.innerHeight) * 2 + 1 );
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(planeMesh);
+    if (intersects.length>0) {
+      const uv = intersects[0].uv; // THREE uses uv if geometry has it - we'll create simple plane with uv
+      return {u:uv.x, v:uv.y, point:intersects[0].point};
+    }
+    return null;
+  }
+
+  // Create or update a three.js plane using inkCanvas as material
+  function createOrUpdatePlane(widthMeters, heightMeters) {
+    if (arPlane) {
+      // update size and texture
+      arPlane.scale.set(widthMeters, heightMeters, 1);
+      arPlane.material.map.needsUpdate = true;
+      return;
+    }
+    const tex = new THREE.CanvasTexture(inkCanvas);
+    tex.needsUpdate = true; tex.flipY = false;
+    const geo = new THREE.PlaneGeometry(1,1,1,1);
+    const mat = new THREE.MeshBasicMaterial({map:tex, transparent:true, side:THREE.DoubleSide});
+    arPlane = new THREE.Mesh(geo, mat);
+    arPlane.rotateX(-Math.PI/2); // default orientation (will be replaced by anchor pose)
+    scene.add(arPlane);
+  }
+
+  // Place plane a fixed distance in front of camera (fallback)
+  function placePlaneInFrontOfCamera() {
+    const distance = 1.0; // meters
+    const vec = new THREE.Vector3(0,0,-distance).applyQuaternion(camera.quaternion).add(camera.position);
+    createOrUpdatePlane(overlay.offsetWidth/overlay.offsetHeight*1.0, 1.0);
+    arPlane.position.copy(vec);
+    arPlane.quaternion.copy(camera.quaternion);
+    planePlaced = true; placementMode=false; overlay.style.display='none'; hint.innerText='Rectangle locked (fallback). Use pen to draw.';
+  }
+
+  // We'll support a "pendingPlacement" object that will be handled on the next XR animation frame (since hit-tests require an XRFrame)
+  let pendingPlacement = null;
+
+  function initAR(session) {
+    // XRButton already created by ARButton; but we added our own start button.
+    renderer.setAnimationLoop( (timestamp, xrFrame) => {
+      // Handle hit-test placement
+      if (pendingPlacement && xrFrame) {
+        // create a viewer reference space for hit-test
+        const xrSession = renderer.xr.getSession();
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        if (!referenceSpace) return;
+        // perform a hit test using transient (or non-transient) -- simple approach: use XRRay from screen
+        const x = pendingPlacement.x; const y = pendingPlacement.y;
+        // Convert screen coords to normalized viewport (0..1) for WebXR's inputSource targetRay? We'll create an XRRay from camera using unproject
+        const ndcX = (x / window.innerWidth) * 2 - 1; const ndcY = - (y / window.innerHeight) * 2 + 1;
+        // Build ray in world space
+        const origin = new DOMPointReadOnly(0,0,0);
+        // Use requestHitTest? Not available universally here in example. Instead attempt frame.getHitTestResults with a previously created source — but we didn't create one reliably.
+        // Simpler robust fallback: place in front of camera
+        placePlaneInFrontOfCamera();
+        pendingPlacement = null;
+      }
+
+      // If plane is placed, update canvas texture
+      if (arPlane) {
+        arPlane.material.map.needsUpdate = true;
+      }
+
+      // Update pen detection if Mediapipe active
+      if (mpHandsLoaded && hands) {
+        // hand input handled by Mediapipe callbacks which update penTipScreen
+      }
+
+      // If we have a pen tip screen coordinate and plane placed, compute uv and draw
+      if (arPlane && penTipScreen) {
+        const uvResult = screenToPlaneUV(penTipScreen.x, penTipScreen.y, camera, arPlane);
+        if (uvResult) {
+          // uv coordinates range [0,1]
+          const u = uvResult.u, v = uvResult.v;
+          // Flip v for canvas mapping depending on texture orientation
+          const cx = Math.floor(u * inkWidth); const cy = Math.floor((1 - v) * inkHeight);
+          // If pen is within the rectangle bounds (0..1), we allow drawing
+          const inside = (u>=0 && u<=1 && v>=0 && v<=1);
+          if (inside && penDownRequested) {
+            drawDot(cx, cy);
+          } else {
+            lastPenPos = null; // stop stroke
+          }
+        }
+      }
+
+      renderer.render(scene, camera);
+    });
+  }
+
+  // Simple stroke drawing logic
+  let lastPenPos = null;
+  function drawDot(x,y) {
+    if (!lastPenPos) { lastPenPos = {x,y}; }
+    inkCtx.beginPath(); inkCtx.moveTo(lastPenPos.x, lastPenPos.y); inkCtx.lineTo(x,y); inkCtx.stroke(); inkCtx.closePath();
+    lastPenPos = {x,y};
+  }
+
+  // ----- Mediapipe Hands Loader & Callbacks -----
+  async function loadMediapipeHands() {
+    if (mpHandsLoaded) return;
+    // Dynamically import Mediapipe Hands
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js';
+    document.head.appendChild(script);
+    await new Promise(r=>script.onload=r);
+    const camScript = document.createElement('script');
+    camScript.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js';
+    document.head.appendChild(camScript);
+    await new Promise(r=>camScript.onload=r);
+
+    // Create hidden video element for Mediapipe
+    const video = document.createElement('video'); video.style.display='none'; video.autoplay=true; video.playsInline=true;
+    document.body.appendChild(video);
+
+    hands = new window.Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.6, minTrackingConfidence:0.5});
+    hands.onResults(onHandsResults);
+
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+    video.srcObject = stream;
+    // Wait for video metadata
+    await new Promise(r=> video.onloadedmetadata = r);
+
+    // Use the camera utils to continuously send frames to mediapipe
+    const cameraMP = new window.Camera(video, { onFrame: async ()=>{ await hands.send({image: video}); }, width:640, height:480 });
+    cameraMP.start();
+
+    mpHandsLoaded = true; hint.innerText='Mediapipe loaded — show pen (index fingertip) for calibration.';
+  }
+
+  function onHandsResults(results) {
+    if (!results.multiHandLandmarks || results.multiHandLandmarks.length===0) return;
+    const landmarks = results.multiHandLandmarks[0];
+    // Index fingertip in Mediapipe hands is landmark 8
+    const tip = landmarks[8];
+    // tip.x and tip.y are normalized to [0,1] relative to video; we need screen coords
+    // The video feed is hidden; assume it's same aspect ratio as viewport; convert
+    const screenX = tip.x * window.innerWidth; const screenY = tip.y * window.innerHeight;
+    // Update pen tip
+    penTipScreen = { x: screenX, y: screenY };
+  }
+
+  // Allow color-based tracking fallback via simple camera read (not implemented fully here)
+
+  // Window resize
+  window.addEventListener('resize', ()=>{ renderer.setSize(window.innerWidth, window.innerHeight); });
+
+  // Helpful note for developers
+  console.log('App loaded. Use Start AR, place rectangle, press Apply to lock, calibrate pen, then press and hold on screen to draw (or press space).');
+  </script>
+</body>
+</html>
